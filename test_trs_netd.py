@@ -10,6 +10,8 @@ Tests all protocol operations against a running trs-netd server:
   - @echo -> 256B payload echo
   - Printer byte spooling ('#')
   - Multi-request session handling
+  - Inter-command delimiter resilience (CRLF, LFCR, stray newlines)
+  - @rhdr multi-sector directory query handshake
 """
 
 from __future__ import annotations
@@ -46,11 +48,13 @@ class TestTRSNetDaemon(unittest.TestCase):
         sector0 = b"\x01" * 256
         # Sector 1 (offset 512): fill with 0x02
         sector1 = b"\x02" * 256
+        # Sector 2 (offset 768): fill with 0x03
+        sector2 = b"\x03" * 256
         # Fill rest with zeros up to 737,536 bytes
-        padding = b"\x00" * (737536 - len(header) - len(sector0) - len(sector1))
+        padding = b"\x00" * (737536 - len(header) - len(sector0) - len(sector1) - len(sector2))
 
         with open(cls.test_vol, "wb") as f:
-            f.write(header + sector0 + sector1 + padding)
+            f.write(header + sector0 + sector1 + sector2 + padding)
 
         # Launch trs-netd
         cmd = [
@@ -196,6 +200,80 @@ class TestTRSNetDaemon(unittest.TestCase):
             content = f.read()
         self.assertIn("ABC", content)
 
+    def test_08_crlf_and_stray_delimiters(self) -> None:
+        """Verify server correctly ignores stray CR, LF, and whitespace between commands."""
+        with self._connect() as s:
+            # Send with mixed CRLF and stray newlines
+            s.sendall(b"\r\n\r\n@ping\r\n\r\n\r\n<00000\n\r")
+            pong = self._recv_line(s)
+            self.assertEqual(pong, b"@pong")
+
+            data = self._recv_exact(s, 256)
+            chk_raw = self._recv_exact(s, 4)
+            self.assertEqual(data, b"\x01" * 256)
+
+    def test_09_rhdr_handshake(self) -> None:
+        """Verify full @rhdr multi-stage query sequence used by TRS-OS IPL."""
+        with self._connect() as s:
+            s.sendall(b"@rhdr\n")
+            header = self._recv_exact(s, 256)
+            self.assertEqual(header, b"\xaa" * 256)
+
+            # Client then requests sector 0 (query_rd_sector: <00000\n\r)
+            s.sendall(b"<00000\n")
+            sec0 = self._recv_exact(s, 256)
+            self.assertEqual(sec0, b"\x01" * 256)
+
+            # Client then requests sector 2
+            s.sendall(b"<00002\n")
+            sec2 = self._recv_exact(s, 256)
+            self.assertEqual(sec2, b"\x03" * 256)
+
+    def test_10_write_checksum_mismatch_protection(self) -> None:
+        """Verify that a write with an invalid client checksum is rejected and not written to disk."""
+        sec_num = 6
+        bad_payload = b"\x77" * 256
+        bad_chksum_bytes = b"\x00\x00\x00\xfe"  # Actual checksum of 256 * 0x77 is 0
+
+        with self._connect() as s:
+            # 1. Attempt write with mismatched client checksum
+            s.sendall(f">{sec_num:05d}\n".encode("ascii"))
+            s.sendall(bad_payload)
+            s.sendall(bad_chksum_bytes)
+
+            ret_chk = self._recv_exact(s, 4)
+            self.assertEqual(ret_chk, b"\x00\x00\x00\x00")  # Server returned calculated sum (0)
+
+            # 2. Read back sector 6 to verify it was NOT committed
+            s.sendall(f"<{sec_num:05d}\n".encode("ascii"))
+            read_back = self._recv_exact(s, 256)
+            _ = self._recv_exact(s, 4)
+            self.assertEqual(read_back, b"\x00" * 256, "Corrupted sector must NOT be written on checksum mismatch")
+
+            # 3. Perform retry write ('/') with matching checksum
+            good_chksum_bytes = b"\x00\x00\x00\x00"
+            s.sendall(f"/{sec_num:05d}\n".encode("ascii"))
+            s.sendall(bad_payload)
+            s.sendall(good_chksum_bytes)
+
+            ret_chk2 = self._recv_exact(s, 4)
+            self.assertEqual(ret_chk2, b"\x00\x00\x00\x00")
+
+            # 4. Read back sector 6 to verify successful write
+            s.sendall(f"<{sec_num:05d}\n".encode("ascii"))
+            read_back2 = self._recv_exact(s, 256)
+            _ = self._recv_exact(s, 4)
+            self.assertEqual(read_back2, bad_payload)
+
+    def test_11_unrecognized_command_recovery(self) -> None:
+        """Verify server gracefully ignores unknown command bytes without desyncing or crashing."""
+        with self._connect() as s:
+            # Send unknown command byte followed by valid ping
+            s.sendall(b"Z\n@ping\n")
+            pong = self._recv_line(s)
+            self.assertEqual(pong, b"@pong")
+
 
 if __name__ == "__main__":
     unittest.main()
+
