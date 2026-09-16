@@ -2,8 +2,8 @@
 """
 trs-netd.py - TRS-NET TCP/IP Network Server Daemon for TRS-OS
 
-Listens for TCP/IP stream connections from TRS-OS clients (e.g., Olimex Agon Light 2
-using MOD-WIFI-ESP8266 in transparent Wi-Fi streaming mode, or retrocomputing emulators).
+Listens for TCP/IP stream connections from TRS-OS clients (e.g., Agon family
+systems using MOD-WIFI-ESP8266 in transparent Wi-Fi streaming mode, or retrocomputing emulators).
 
 Implements the TRS-NET remote block storage protocol:
   - Sector Read ('<') and Re-read ('\\') with 8-bit checksums
