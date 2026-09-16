@@ -79,9 +79,18 @@ options:
 
 ---
 
-## Included Disk Volumes (`Volumes/`)
+## Fetching Disk Volumes (`make fetch`)
 
-The repository includes pre-built virtual disk images extracted from upstream distributions:
+To keep this repository lean and avoid duplicating upstream binary assets in git, disk images are not tracked directly in the repository. Instead, the `Makefile` automatically downloads and unpacks them from Daniel Paul Martin's official distribution:
+
+```bash
+# Fetch and unpack disk images into Volumes/
+make fetch
+```
+
+*(Note: `make run` will also automatically invoke `make fetch` if the default volume is not yet present).*
+
+### Available Upstream Volumes:
 
 | Image | Size | Format / Purpose |
 | :--- | :--- | :--- |
@@ -95,6 +104,11 @@ The repository includes pre-built virtual disk images extracted from upstream di
 To serve an alternate volume:
 ```bash
 python3 trs-netd.py --volume Volumes/sys12M.dsk --port 65432
+```
+
+To remove all downloaded assets and return the repo to its minimal footprint:
+```bash
+make distclean
 ```
 
 ---
@@ -151,23 +165,17 @@ The test suite validates:
 
 ```
 trs-net-tcp/
-├── Makefile            # Convenience run and test targets
+├── Makefile            # Convenience run, fetch, test, and clean targets
 ├── README.md           # Project documentation and protocol specification
-├── .gitignore          # Git exclusion rules (.venv, caches, etc.)
+├── .gitignore          # Git exclusion rules (.venv, Volumes/, caches, etc.)
 ├── trs-netd.py         # Main TCP/IP network server daemon
 ├── test_trs_netd.py    # Integration & unit test suite
-├── Volumes/            # Virtual floppy disk images (.dsk)
+├── Volumes/            # Virtual floppy disk images (fetched via 'make fetch')
 │   ├── sys720k.dsk
 │   ├── sys12M.dsk
-│   ├── sys180k.dsk
-│   ├── sys631.dsk
-│   ├── sys631.X.dsk
-│   └── bldtools.dsk
-├── printer/            # Printer spool output directory
-│   └── print_out.txt
-└── upstream/           # Original upstream reference files
-    ├── TRS-NET.py      # Daniel Paul Martin's original serial script
-    └── TRS-OS_Squirrel.bin
+│   └── ...
+└── printer/            # Printer spool output directory (created on demand)
+    └── print_out.txt
 ```
 
 ---

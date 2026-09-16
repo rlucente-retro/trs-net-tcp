@@ -154,7 +154,10 @@ class TRSNetServer:
     def open_volume(self) -> None:
         """Open the target disk image file."""
         if not self.volume_path.exists():
-            raise FileNotFoundError(f"Volume image not found: {self.volume_path}")
+            raise FileNotFoundError(
+                f"Volume image not found: {self.volume_path}. "
+                "Run 'make fetch' to download standard disk volumes from upstream."
+            )
         self.vol_file = open(self.volume_path, "r+b")
         self.vol_file.seek(0, os.SEEK_END)
         self.vol_size = self.vol_file.tell()

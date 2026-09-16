@@ -41,6 +41,8 @@ ENV/
 *.swp
 *.swo
 
-# Runtime printer output (keep printer/ directory structure)
-printer/*.txt
-!printer/print_out.txt
+# Upstream downloaded assets & archives (fetched via Makefile)
+TRS-NET.zip
+Volumes/
+printer/
+upstream/
