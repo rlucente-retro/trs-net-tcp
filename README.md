@@ -4,7 +4,7 @@
 
 `trs-net-tcp` provides a host-side network disk server daemon (`trs-netd.py`) that serves virtual floppy disk images (`.dsk`) and spools printer output for **TRS-OS** (TRSDOS / LS-DOS 6.3 adapted for the Zilog eZ80) over **TCP/IP sockets** instead of legacy physical RS-232 serial cables.
 
-This enables retrocomputing systems—such as the **Agon family** (Agon Light, Agon Light 2, etc.) equipped with a **MOD-WIFI-ESP8266** module—to mount remote disk drives (e.g., Drive `:6`) and perform file operations (`COPY`, `BACKUP`, `DIR`) seamlessly over Wi-Fi.
+This enables retrocomputing systems—such as the **Agon family** (Agon Light, Agon Light 2, etc.) equipped with a Wi-Fi coprocessor supporting the **Espressif ESP-AT (v1.7.x or later)** command set API—to mount remote disk drives (e.g., Drive `:6`) and perform file operations (`COPY`, `BACKUP`, `DIR`) seamlessly over Wi-Fi.
 
 ---
 
@@ -14,8 +14,8 @@ In the original TRS-NET architecture developed by **Daniel Paul Martin** ([danie
 
 `trs-net-tcp` modernizes this architecture:
 1. **TCP/IP Socket Transport:** Instead of opening a local serial port, `trs-netd.py` listens on a TCP socket (default port `65432` or configurable).
-2. **Transparent Wi-Fi Passthrough:** On the Agon family, the connected MOD-WIFI-ESP8266 connects to the host server via TCP and enters transparent UART-WiFi passthrough mode (`AT+CIPMODE=1` & `AT+CIPSEND`).
-3. **Zero Wire-Protocol Changes:** The eZ80 disk driver (`driver-FDCDVR.S` / `driver-NETDVR.S`) continues to speak the exact same TRS-NET block protocol; the ESP8266 and `trs-netd.py` transparently tunnel the stream across TCP/IP.
+2. **Transparent Wi-Fi Passthrough:** On the Agon family, the connected Wi-Fi coprocessor (running ESP-AT v1.7.x+ firmware) connects to the host server via TCP and enters transparent UART-WiFi passthrough mode (`AT+CIPMODE=1` & `AT+CIPSEND`).
+3. **Zero Wire-Protocol Changes:** The eZ80 disk driver (`driver-FDCDVR.S` / `driver-NETDVR.S`) continues to speak the exact same TRS-NET block protocol; the Wi-Fi coprocessor and `trs-netd.py` transparently tunnel the stream across TCP/IP.
 4. **Resilient Streaming:** Implements framed `recv_exact()` and buffered socket parsing to eliminate fragmentation issues common when tunneling serial protocols over packet networks.
 
 ```
@@ -28,8 +28,8 @@ In the original TRS-NET architecture developed by **Daniel Paul Martin** ([danie
 |  +---------+----------+  |                         |  +---------+----------+  |
 |            | UART1       |                         |            | TCP Socket  |
 |  +---------v----------+  |   Wi-Fi / LAN Network   |  +---------v----------+  |
-|  |  MOD-WIFI-ESP8266  | <===========================> |   port 65432 / TCP |  |
-|  | (Transparent Mode) |  |                         |  +--------------------+  |
+|  |  Wi-Fi Coprocessor | <===========================> |   port 65432 / TCP |  |
+|  | (ESP-AT v1.7.x+)   |  |                         |  +--------------------+  |
 |  +--------------------+  |                         |  | Volumes/sys720k.dsk|  |
 +--------------------------+                         |  | printer/print_out  |  |
                                                      +--------------------------+
