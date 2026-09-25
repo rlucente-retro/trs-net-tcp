@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """
-trs-netd.py - TRS-NET TCP/IP Network Server Daemon for TRS-OS
+trs-netd.py - TRS-NET TCP/IP Network & Serial Server Daemon for TRS-OS
 
-Listens for TCP/IP stream connections from TRS-OS clients (e.g., Agon family
-systems using an ESP-AT v1.7.x+ Wi-Fi coprocessor in transparent streaming mode, or retrocomputing emulators).
+Serves virtual floppy disk images (.dsk) and spools printer output for TRS-OS
+(TRSDOS / LS-DOS 6.3 adapted for the Zilog eZ80, such as the Agon family of computers).
+
+Supports two communication transports:
+  1. TCP/IP Socket: For networked systems (e.g., Agon family with an ESP-AT v1.7.x+
+     Wi-Fi coprocessor in transparent passthrough mode, or retrocomputing emulators).
+  2. Serial Port: For direct physical serial links (e.g., Olimex MOD-USB-RS232,
+     USB CDC-ACM virtual COM ports, or legacy RS-232 serial cables).
 
 Implements the TRS-NET remote block storage protocol:
   - Sector Read ('<') and Re-read ('\\') with 8-bit checksums
@@ -31,7 +37,16 @@ import struct
 import sys
 import time
 from types import FrameType
-from typing import BinaryIO, Final
+from typing import Any, BinaryIO, Final, Protocol
+
+# Optional pyserial dependency for serial transport
+try:
+    import serial
+    import serial.tools.list_ports
+    HAVE_PYSERIAL = True
+except ImportError:
+    serial = None  # type: ignore[assignment]
+    HAVE_PYSERIAL = False
 
 logger = logging.getLogger("trs-netd")
 
@@ -72,43 +87,195 @@ class ServerStats:
         )
 
 
-class BufferedSocketReader:
-    """
-    Buffered reader over a TCP socket with precise framing helpers.
+class StreamTransport(Protocol):
+    """Abstract bidirectional stream transport interface."""
 
-    Handles TCP segmentation, arbitrary chunk boundaries, and cleans stray
+    @property
+    def name(self) -> str:
+        """Human-readable identifier for logging."""
+        ...
+
+    def is_alive(self) -> bool:
+        """Return True if connection is currently active."""
+        ...
+
+    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        """Read up to max_bytes from transport. Returns b'' on timeout or EOF."""
+        ...
+
+    def write(self, data: bytes) -> None:
+        """Send data through transport."""
+        ...
+
+    def close(self) -> None:
+        """Close the transport."""
+        ...
+
+
+class SocketTransport:
+    """Bidirectional stream transport over a TCP socket."""
+
+    def __init__(self, sock: socket.socket, addr: tuple[str, int]) -> None:
+        self.sock = sock
+        self.addr = addr
+        self._alive = True
+        self._name = f"{addr[0]}:{addr[1]}"
+        # Optimize for interactive request/response latency (disable Nagle algorithm)
+        self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        if not self._alive:
+            return b""
+        try:
+            if timeout is not None:
+                ready, _, _ = select.select([self.sock], [], [], timeout)
+                if not ready:
+                    return b""
+            chunk = self.sock.recv(max_bytes)
+            if not chunk:
+                self._alive = False
+                return b""
+            return chunk
+        except (ConnectionResetError, BrokenPipeError, OSError):
+            self._alive = False
+            return b""
+
+    def write(self, data: bytes) -> None:
+        if not self._alive:
+            raise ConnectionResetError("Socket is closed")
+        try:
+            self.sock.sendall(data)
+        except (ConnectionResetError, BrokenPipeError, OSError) as err:
+            self._alive = False
+            raise ConnectionResetError(f"Socket write failed: {err}") from err
+
+    def close(self) -> None:
+        self._alive = False
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+class SerialTransport:
+    """Bidirectional stream transport over a local serial port."""
+
+    def __init__(self, ser: Any) -> None:
+        self.ser = ser
+        self._alive = True
+        self._name = f"{getattr(ser, 'port', 'serial')} ({getattr(ser, 'baudrate', 'unknown')} baud)"
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def is_alive(self) -> bool:
+        return self._alive and (self.ser is not None) and getattr(self.ser, "is_open", False)
+
+    def read(self, max_bytes: int, timeout: float | None = None) -> bytes:
+        if not self.is_alive():
+            return b""
+        try:
+            waiting = getattr(self.ser, "in_waiting", 0)
+            if waiting > 0:
+                return bytes(self.ser.read(min(max_bytes, waiting)))
+
+            if timeout is not None and timeout <= 0:
+                return b""
+
+            old_timeout = self.ser.timeout
+            try:
+                if timeout is not None and timeout != old_timeout:
+                    self.ser.timeout = timeout
+                first_byte = bytes(self.ser.read(1))
+                if not first_byte:
+                    return b""
+                more = getattr(self.ser, "in_waiting", 0)
+                if more > 0:
+                    extra = bytes(self.ser.read(min(max_bytes - 1, more)))
+                    return first_byte + extra
+                return first_byte
+            finally:
+                if timeout is not None and timeout != old_timeout:
+                    self.ser.timeout = old_timeout
+        except Exception as err:
+            logger.warning("Serial read error on %s: %s", self.name, err)
+            self._alive = False
+            return b""
+
+    def write(self, data: bytes) -> None:
+        if not self.is_alive():
+            raise ConnectionResetError("Serial port is closed")
+        try:
+            self.ser.write(data)
+        except Exception as err:
+            self._alive = False
+            raise ConnectionResetError(f"Serial write failed: {err}") from err
+
+    def close(self) -> None:
+        self._alive = False
+        try:
+            if self.ser and getattr(self.ser, "is_open", False):
+                self.ser.close()
+        except Exception:
+            pass
+
+
+class BufferedStreamReader:
+    """
+    Buffered reader over any StreamTransport (Socket or Serial) with precise framing helpers.
+
+    Handles TCP segmentation, arbitrary serial chunk boundaries, and cleans stray
     inter-command linefeeds without dropping stream data.
     """
 
-    def __init__(self, sock: socket.socket, timeout: float = 30.0) -> None:
-        self.sock = sock
+    def __init__(self, transport: StreamTransport, timeout: float = 30.0) -> None:
+        self.transport = transport
         self.timeout = timeout
         self._buffer = bytearray()
 
-    def recv_exact(self, count: int) -> bytes:
-        """Receive exactly count bytes from the socket."""
+    def recv_exact(self, count: int, timeout: float | None = None) -> bytes:
+        """Receive exactly count bytes from the transport."""
+        effective_timeout = self.timeout if timeout is None else timeout
+        deadline = time.time() + effective_timeout
         while len(self._buffer) < count:
-            ready, _, _ = select.select([self.sock], [], [], self.timeout)
-            if not ready:
+            remaining = deadline - time.time()
+            if remaining <= 0:
                 raise TimeoutError(f"Timed out waiting for {count} bytes")
-            chunk = self.sock.recv(max(4096, count - len(self._buffer)))
+            chunk = self.transport.read(
+                max(4096, count - len(self._buffer)),
+                timeout=min(remaining, 1.0),
+            )
             if not chunk:
-                raise ConnectionResetError("Remote client closed connection during recv_exact")
+                if not self.transport.is_alive():
+                    raise ConnectionResetError("Remote peer closed connection during recv_exact")
+                continue
             self._buffer.extend(chunk)
 
         result = bytes(self._buffer[:count])
         del self._buffer[:count]
         return result
 
-    def readline(self) -> bytes:
+    def readline(self, timeout: float | None = None) -> bytes:
         """Read bytes until newline (\\n), stripping trailing whitespace."""
+        effective_timeout = self.timeout if timeout is None else timeout
+        deadline = time.time() + effective_timeout
         while b"\n" not in self._buffer:
-            ready, _, _ = select.select([self.sock], [], [], self.timeout)
-            if not ready:
+            remaining = deadline - time.time()
+            if remaining <= 0:
                 raise TimeoutError("Timed out waiting for line termination")
-            chunk = self.sock.recv(4096)
+            chunk = self.transport.read(4096, timeout=min(remaining, 1.0))
             if not chunk:
-                raise ConnectionResetError("Remote client closed connection during readline")
+                if not self.transport.is_alive():
+                    raise ConnectionResetError("Remote peer closed connection during readline")
+                continue
             self._buffer.extend(chunk)
 
         idx = self._buffer.index(b"\n")
@@ -121,16 +288,17 @@ class BufferedSocketReader:
         Read the next command prefix byte.
 
         Skips any leading whitespace (CR, LF, NUL, Space) that may have lingered
-        from previous line terminators. Returns b"" on EOF, or None on idle timeout.
+        from previous line terminators. Returns b"" on EOF/disconnect, or None on idle tick.
         """
         while True:
             while not self._buffer:
-                ready, _, _ = select.select([self.sock], [], [], 1.0)
-                if not ready:
-                    return None  # 1-second idle tick
-                chunk = self.sock.recv(4096)
+                if not self.transport.is_alive():
+                    return b""
+                chunk = self.transport.read(4096, timeout=1.0)
                 if not chunk:
-                    return b""  # Clean EOF from peer
+                    if not self.transport.is_alive():
+                        return b""
+                    return None  # 1-second idle tick: check loop condition and continue
                 self._buffer.extend(chunk)
 
             b = bytes([self._buffer[0]])
@@ -231,26 +399,21 @@ class ClientSession:
 
     def __init__(
         self,
-        conn: socket.socket,
-        addr: tuple[str, int],
+        transport: StreamTransport,
         volume: DiskVolume,
         printer_path: Path,
         stats: ServerStats,
         is_running: Callable[[], bool] = lambda: True,
     ) -> None:
-        self.conn = conn
-        self.addr = addr
+        self.transport = transport
         self.volume = volume
         self.printer_path = printer_path
         self.stats = stats
         self.is_running = is_running
-        self.reader = BufferedSocketReader(conn, timeout=30.0)
-
-        # Optimize for interactive request/response latency (disable Nagle algorithm)
-        self.conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self.reader = BufferedStreamReader(transport, timeout=30.0)
 
     def _send(self, data: bytes) -> None:
-        self.conn.sendall(data)
+        self.transport.write(data)
         self.stats.total_bytes_tx += len(data)
 
     @staticmethod
@@ -263,13 +426,13 @@ class ClientSession:
         raise ValueError(f"Cannot parse integer from: {raw!r}")
 
     def handle(self) -> None:
-        logger.info("Connection established with %s:%d", self.addr[0], self.addr[1])
+        logger.info("Connection established with %s", self.transport.name)
 
         try:
             while self.is_running():
                 cmd_byte = self.reader.read_cmd_byte()
                 if cmd_byte == b"":
-                    # Clean EOF from peer
+                    # Clean EOF / disconnect from peer
                     break
                 if cmd_byte is None:
                     # 1.0s idle tick: check loop condition and continue
@@ -434,25 +597,99 @@ class ClientSession:
 
                 else:
                     logger.warning(
-                        "Unrecognized command byte from %s:%d: %r",
-                        self.addr[0],
-                        self.addr[1],
+                        "Unrecognized command byte from %s: %r",
+                        self.transport.name,
                         cmd_byte,
                     )
 
         except (ConnectionResetError, BrokenPipeError) as err:
-            logger.debug("Connection closed by client: %s", err)
+            logger.debug("Connection closed by peer: %s", err)
         except TimeoutError as err:
             logger.warning("Connection timed out: %s", err)
         except Exception as err:
-            logger.error("Unexpected session error with %s:%d: %s", self.addr[0], self.addr[1], err, exc_info=True)
+            logger.error("Unexpected session error with %s: %s", self.transport.name, err, exc_info=True)
         finally:
-            logger.info("Client %s:%d disconnected.", self.addr[0], self.addr[1])
+            logger.info("Client %s disconnected.", self.transport.name)
             logger.info(self.stats.summary())
 
 
+def list_serial_ports() -> None:
+    """Print detected serial ports to standard output."""
+    if not HAVE_PYSERIAL:
+        print(
+            "Error: 'pyserial' is not installed. Install it with: pip install pyserial",
+            file=sys.stderr,
+        )
+        return
+
+    ports = list(serial.tools.list_ports.comports())
+    if not ports:
+        print("No serial ports detected.")
+        return
+
+    print("Detected serial ports:")
+    for p in ports:
+        desc = p.description or "n/a"
+        hwid = p.hwid or "n/a"
+        print(f"  {p.device:30} - {desc} [{hwid}]")
+
+
+def find_auto_serial_port() -> str | None:
+    """
+    Search for connected USB-to-serial adapters.
+
+    Filters out Bluetooth ports and virtual consoles, preferring /dev/cu.* on macOS.
+    Returns the port device path, or None if none or ambiguous.
+    """
+    if not HAVE_PYSERIAL:
+        logger.error(
+            "'pyserial' is required for serial communication. Install it with: pip install pyserial"
+        )
+        return None
+
+    ports = list(serial.tools.list_ports.comports())
+    if not ports:
+        logger.error("No serial ports detected on the system.")
+        return None
+
+    candidates = []
+    for p in ports:
+        dev_lower = p.device.lower()
+        desc_lower = (p.description or "").lower()
+        # Ignore virtual Bluetooth and debug console devices
+        if "bluetooth" in dev_lower or "bluetooth" in desc_lower or "debug-console" in dev_lower:
+            continue
+        # Look for typical USB-serial drivers or USB VID/PID
+        if (
+            any(marker in dev_lower for marker in ("usbmodem", "usbserial", "ttyacm", "ttyusb", "com"))
+            or getattr(p, "vid", None) is not None
+        ):
+            candidates.append(p)
+
+    # On macOS, prefer /dev/cu.* over /dev/tty.* to avoid carrier-detect blocking
+    if sys.platform == "darwin":
+        cu_candidates = [p for p in candidates if p.device.startswith("/dev/cu.")]
+        if cu_candidates:
+            candidates = cu_candidates
+
+    if len(candidates) == 1:
+        chosen = candidates[0]
+        logger.info("Auto-detected serial port: %s (%s)", chosen.device, chosen.description)
+        return chosen.device
+    elif len(candidates) > 1:
+        logger.error("Multiple USB serial ports detected. Please specify one with --serial <port>:")
+        for p in candidates:
+            logger.error("  %s - %s", p.device, p.description)
+        return None
+    else:
+        logger.error("No USB serial devices detected. Available ports:")
+        for p in ports:
+            logger.error("  %s - %s", p.device, p.description)
+        return None
+
+
 class TRSNetDaemon:
-    """Main TCP Server Daemon lifecycle manager."""
+    """Main TCP & Serial Server Daemon lifecycle manager."""
 
     def __init__(
         self,
@@ -460,11 +697,17 @@ class TRSNetDaemon:
         printer_path: Path,
         host: str = "0.0.0.0",
         port: int = 65432,
+        serial_port: str | None = None,
+        baud_rate: int = 115200,
+        rtscts: bool = False,
     ) -> None:
         self.volume = DiskVolume(volume_path)
         self.printer_path = printer_path
         self.host = host
         self.port = port
+        self.serial_port = serial_port
+        self.baud_rate = baud_rate
+        self.rtscts = rtscts
         self.stats = ServerStats()
         self.running = False
         self.shutdown_signal: int | None = None
@@ -483,6 +726,21 @@ class TRSNetDaemon:
         self.volume.open()
         self.running = True
 
+        try:
+            if self.serial_port:
+                self._run_serial()
+            else:
+                self._run_tcp()
+        finally:
+            self.volume.close()
+            if self.shutdown_signal is not None:
+                signame = signal.Signals(self.shutdown_signal).name
+                logger.info("Received %s, graceful shutdown complete.", signame)
+            else:
+                logger.info("Server shutdown complete.")
+
+    def _run_tcp(self) -> None:
+        """Run TCP/IP server accept loop."""
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind((self.host, self.port))
@@ -492,42 +750,104 @@ class TRSNetDaemon:
             logger.info("=" * 60)
             logger.info("  TRS-NET TCP Server Daemon (trs-netd)")
             logger.info("=" * 60)
-            logger.info("Listening on:   %s:%d", self.host, self.port)
+            logger.info("Listening on:   %s:%d (TCP)", self.host, self.port)
             logger.info("Volume Image:   %s", self.volume.path)
             logger.info("Printer Spool:  %s", self.printer_path)
             logger.info("Waiting for client connections (Ctrl+C to stop)...")
             logger.info("=" * 60)
 
-            try:
-                while self.running:
-                    try:
-                        ready, _, _ = select.select([s], [], [], 1.0)
-                        if not ready:
-                            continue
-                        conn, addr = s.accept()
-                    except OSError:
-                        if not self.running:
-                            break
+            while self.running:
+                try:
+                    ready, _, _ = select.select([s], [], [], 1.0)
+                    if not ready:
                         continue
+                    conn, addr = s.accept()
+                except OSError:
+                    if not self.running:
+                        break
+                    continue
 
-                    with conn:
-                        session = ClientSession(
-                            conn=conn,
-                            addr=addr,
-                            volume=self.volume,
-                            printer_path=self.printer_path,
-                            stats=self.stats,
-                            is_running=lambda: self.running,
-                        )
-                        session.handle()
+                with conn:
+                    transport = SocketTransport(conn, addr)
+                    session = ClientSession(
+                        transport=transport,
+                        volume=self.volume,
+                        printer_path=self.printer_path,
+                        stats=self.stats,
+                        is_running=lambda: self.running,
+                    )
+                    session.handle()
 
-            finally:
-                self.volume.close()
-                if self.shutdown_signal is not None:
-                    signame = signal.Signals(self.shutdown_signal).name
-                    logger.info("Received %s, graceful shutdown complete.", signame)
-                else:
-                    logger.info("Server shutdown complete.")
+    def _run_serial(self) -> None:
+        """Run Serial port server session loop."""
+        if not HAVE_PYSERIAL:
+            logger.error(
+                "'pyserial' is required for serial communication. Install it with: pip install pyserial"
+            )
+            return
+
+        port_name = self.serial_port
+        if port_name == "auto":
+            detected = find_auto_serial_port()
+            if not detected:
+                return
+            port_name = detected
+
+        if sys.platform == "darwin" and port_name.startswith("/dev/tty."):
+            cu_name = port_name.replace("/dev/tty.", "/dev/cu.")
+            logger.warning(
+                "On macOS, '%s' may hang waiting for carrier detect (DCD). Consider using '%s' instead.",
+                port_name,
+                cu_name,
+            )
+
+        logger.info("=" * 60)
+        logger.info("  TRS-NET Serial Server Daemon (trs-netd)")
+        logger.info("=" * 60)
+        logger.info("Serial Port:    %s", port_name)
+        logger.info("Baud Rate:      %d baud (8-N-1, RTS/CTS: %s)", self.baud_rate, self.rtscts)
+        logger.info("Volume Image:   %s", self.volume.path)
+        logger.info("Printer Spool:  %s", self.printer_path)
+        logger.info("Listening for TRS-OS requests (Ctrl+C to stop)...")
+        logger.info("=" * 60)
+
+        while self.running:
+            try:
+                ser = serial.Serial(
+                    port=port_name,
+                    baudrate=self.baud_rate,
+                    bytesize=serial.EIGHTBITS,
+                    parity=serial.PARITY_NONE,
+                    stopbits=serial.STOPBITS_ONE,
+                    rtscts=self.rtscts,
+                    timeout=1.0,
+                    write_timeout=5.0,
+                )
+                with ser:
+                    try:
+                        ser.reset_input_buffer()
+                        ser.reset_output_buffer()
+                    except Exception:
+                        pass
+
+                    transport = SerialTransport(ser)
+                    session = ClientSession(
+                        transport=transport,
+                        volume=self.volume,
+                        printer_path=self.printer_path,
+                        stats=self.stats,
+                        is_running=lambda: self.running,
+                    )
+                    session.handle()
+            except serial.SerialException as err:
+                if not self.running:
+                    break
+                logger.warning(
+                    "Serial communication error on %s: %s. Retrying in 2 seconds...",
+                    port_name,
+                    err,
+                )
+                time.sleep(2.0)
 
 
 def configure_logging(verbose: bool = False) -> None:
@@ -543,20 +863,46 @@ def configure_logging(verbose: bool = False) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="TRS-NET TCP/IP Network Server Daemon for TRS-OS (trs-netd)"
+        description="TRS-NET TCP/IP Network & Serial Server Daemon for TRS-OS (trs-netd)"
     )
     parser.add_argument(
         "--port",
         "-p",
         type=int,
         default=65432,
-        help="TCP port to listen on (default: 65432)",
+        help="TCP port to listen on (default: 65432, ignored if --serial is set)",
     )
     parser.add_argument(
         "--host",
         "-H",
         default="0.0.0.0",
-        help="Host/IP address to bind to (default: 0.0.0.0)",
+        help="Host/IP address to bind to (default: 0.0.0.0, ignored if --serial is set)",
+    )
+    parser.add_argument(
+        "--serial",
+        "-s",
+        nargs="?",
+        const="auto",
+        default=None,
+        help="Serial port device (e.g. /dev/cu.usbmodem*, /dev/ttyACM0, COM3, or 'auto')",
+    )
+    parser.add_argument(
+        "--baud",
+        "-b",
+        type=int,
+        default=115200,
+        help="Serial baud rate (default: 115200)",
+    )
+    parser.add_argument(
+        "--rtscts",
+        action="store_true",
+        default=False,
+        help="Enable RTS/CTS hardware flow control for serial (default: False)",
+    )
+    parser.add_argument(
+        "--list-ports",
+        action="store_true",
+        help="List detected serial ports and exit",
     )
     parser.add_argument(
         "--volume",
@@ -579,6 +925,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    if args.list_ports:
+        list_serial_ports()
+        return 0
+
     configure_logging(verbose=args.verbose)
 
     daemon = TRSNetDaemon(
@@ -586,6 +936,9 @@ def main(argv: list[str] | None = None) -> int:
         printer_path=args.printer,
         host=args.host,
         port=args.port,
+        serial_port=args.serial,
+        baud_rate=args.baud,
+        rtscts=args.rtscts,
     )
     daemon.run()
     return 0

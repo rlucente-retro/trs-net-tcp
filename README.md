@@ -1,22 +1,24 @@
 # trs-net-tcp
 
-**TRS-NET TCP/IP Network Server Daemon for TRS-OS**
+**TRS-NET TCP/IP Network & Serial Server Daemon for TRS-OS**
 
-`trs-net-tcp` provides a host-side network disk server daemon (`trs-netd.py`) that serves virtual floppy disk images (`.dsk`) and spools printer output for **TRS-OS** (TRSDOS / LS-DOS 6.3 adapted for the Zilog eZ80) over **TCP/IP sockets** instead of legacy physical RS-232 serial cables.
+`trs-net-tcp` provides a host-side network disk server daemon (`trs-netd.py`) that serves virtual floppy disk images (`.dsk`) and spools printer output for **TRS-OS** (TRSDOS / LS-DOS 6.3 adapted for the Zilog eZ80) over **TCP/IP sockets** or direct **Serial COM / TTY ports**.
 
-This enables retrocomputing systems—such as the **Agon family** (Agon Light, Agon Light 2, etc.) equipped with a Wi-Fi coprocessor supporting the **Espressif ESP-AT (v1.7.x or later)** command set API—to mount remote disk drives (e.g., Drive `:6`) and perform file operations (`COPY`, `BACKUP`, `DIR`) seamlessly over Wi-Fi.
+This enables retrocomputing systems—such as the **Agon family** (Agon Light, Agon Light 2, etc.)—to mount remote disk drives (e.g., Drive `:6`) and perform file operations (`COPY`, `BACKUP`, `DIR`) seamlessly:
+* **Over Wi-Fi (TCP/IP):** Equipped with a Wi-Fi coprocessor supporting the **Espressif ESP-AT (v1.7.x or later)** command set API in transparent passthrough mode.
+* **Over Serial:** Connected directly via a USB-to-serial adapter, such as the **Olimex MOD-USB-RS232** module on the UEXT expansion header, or traditional RS-232 serial cables.
 
 ---
 
 ## Background & Architecture
 
-In the original TRS-NET architecture developed by **Daniel Paul Martin** ([danielpaulmartin.com](https://danielpaulmartin.com/home/research/)), `TRS-NET.py` acted as a host-side server that communicated with the eZ80 target exclusively through a local serial COM / TTY port (`pyserial`) with hardware RTS/CTS flow control.
+In the original TRS-NET architecture developed by **Daniel Paul Martin** ([danielpaulmartin.com](https://danielpaulmartin.com/home/research/)), `TRS-NET.py` communicated with the eZ80 target through a local serial COM / TTY port.
 
-`trs-net-tcp` modernizes this architecture:
-1. **TCP/IP Socket Transport:** Instead of opening a local serial port, `trs-netd.py` listens on a TCP socket (default port `65432` or configurable).
-2. **Transparent Wi-Fi Passthrough:** On the Agon family, the connected Wi-Fi coprocessor (running ESP-AT v1.7.x+ firmware) connects to the host server via TCP and enters transparent UART-WiFi passthrough mode (`AT+CIPMODE=1` & `AT+CIPSEND`).
-3. **Zero Wire-Protocol Changes:** The eZ80 disk driver (`driver-FDCDVR.S` / `driver-NETDVR.S`) continues to speak the exact same TRS-NET block protocol; the Wi-Fi coprocessor and `trs-netd.py` transparently tunnel the stream across TCP/IP.
-4. **Resilient Streaming:** Implements framed `recv_exact()` and buffered socket parsing to eliminate fragmentation issues common when tunneling serial protocols over packet networks.
+`trs-net-tcp` provides a unified server supporting both transports:
+1. **TCP/IP Socket Transport:** Listens on a TCP socket (default port `65432`). On the Agon family, the Wi-Fi coprocessor connects to the host server and enters transparent UART-WiFi passthrough mode (`AT+CIPMODE=1` & `AT+CIPSEND`).
+2. **Serial Port Transport:** Connects directly to a local serial device (e.g., `/dev/cu.usbmodem*` on macOS, `/dev/ttyACM*` on Linux, `COM*` on Windows) at configurable baud rates (default `115200 8-N-1`).
+3. **Zero Wire-Protocol Changes:** The eZ80 disk driver (`driver-FDCDVR.S` / `driver-NETDVR.S`) speaks the exact same TRS-NET block protocol across both transports without any driver modifications.
+4. **Resilient Streaming:** Implements a unified `StreamTransport` and framed `BufferedStreamReader` to eliminate chunk fragmentation and handle stray line delimiters across packet networks and serial streams alike.
 
 ```
 +--------------------------+                         +--------------------------+
@@ -24,14 +26,20 @@ In the original TRS-NET architecture developed by **Daniel Paul Martin** ([danie
 |                          |                         |                          |
 |  +--------------------+  |                         |  +--------------------+  |
 |  |       TRS-OS       |  |                         |  |    trs-netd.py     |  |
-|  |  (Drive :6 driver) |  |                         |  |    (TCP Server)    |  |
+|  |  (Drive :6 driver) |  |                         |  |  (TCP/Serial Svr)  |  |
 |  +---------+----------+  |                         |  +---------+----------+  |
-|            | UART1       |                         |            | TCP Socket  |
-|  +---------v----------+  |   Wi-Fi / LAN Network   |  +---------v----------+  |
-|  |  Wi-Fi Coprocessor | <===========================> |   port 65432 / TCP |  |
-|  | (ESP-AT v1.7.x+)   |  |                         |  +--------------------+  |
-|  +--------------------+  |                         |  | Volumes/sys720k.dsk|  |
-+--------------------------+                         |  | printer/print_out  |  |
+|            | UART1       |                         |            |             |
+|            |             |   Wi-Fi / LAN Network   |            |             |
+|  +---------v----------+  |   (TCP port 65432)      |            |             |
+|  |  Wi-Fi Coprocessor | <==========================> [TCP Mode] |             |
+|  | (ESP-AT v1.7.x+)   |  |                         |            |             |
+|  +--------------------+  |                         |            |             |
+|            |             |   USB CDC-ACM / Serial  |            |             |
+|  +---------v----------+  |   (/dev/cu.usbmodem*)   |            |             |
+|  |   MOD-USB-RS232    | <==========================> [Serial]   |             |
+|  +--------------------+  |                         |  +---------v----------+  |
++--------------------------+                         |  | Volumes/sys720k.dsk|  |
+                                                     |  | printer/print_out  |  |
                                                      +--------------------------+
 ```
 
@@ -42,35 +50,64 @@ In the original TRS-NET architecture developed by **Daniel Paul Martin** ([danie
 ### 1. Prerequisites
 * Python 3.9+
 * macOS, Linux, or Windows
+* Optional: `pyserial>=3.5` (required only when using Serial mode)
 
 ### 2. Setup Virtual Environment
 ```bash
+make setup
+# Or manually:
 python3 -m venv .venv
 source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-### 3. Run the Server
+### 3. Run in TCP/IP Mode
 ```bash
-# Run with default options (port 65432, Volumes/sys720k.dsk)
+# Run with default TCP options (port 65432, Volumes/sys720k.dsk)
 make run
 
 # Or run with verbose debug logging
 make run-verbose
 ```
 
-### 4. Command-Line Options
+### 4. Run in Serial Mode (e.g. Olimex MOD-USB-RS232)
+```bash
+# List all detected serial ports
+make list-ports
+
+# Auto-detect connected USB serial adapter and run
+make run SERIAL=auto
+
+# Or explicitly specify the serial device
+make run SERIAL=/dev/cu.usbmodem14101
+
+# Or run directly with Python at 115200 baud
+python3 trs-netd.py --serial /dev/cu.usbmodem* --baud 115200
+```
+
+> [!TIP]
+> On macOS, always use `/dev/cu.*` instead of `/dev/tty.*` to avoid carrier-detect blocking when using adapters without DCD lines.
+
+---
+
+## Command-Line Options
+
 ```text
-usage: trs-netd.py [-h] [--port PORT] [--host HOST] [--volume VOLUME]
+usage: trs-netd.py [-h] [--port PORT] [--host HOST] [--serial [SERIAL]]
+                   [--baud BAUD] [--rtscts] [--list-ports] [--volume VOLUME]
                    [--printer PRINTER] [--verbose]
 
-TRS-NET TCP/IP Network Server Daemon for TRS-OS (trs-netd)
+TRS-NET TCP/IP Network & Serial Server Daemon for TRS-OS (trs-netd)
 
 options:
   -h, --help            show this help message and exit
-  --port PORT, -p PORT  TCP port to listen on (default: 65432)
-  --host HOST, -H HOST  Host/IP address to bind to (default: 0.0.0.0)
-  --volume VOLUME, -v VOLUME
-                        Path to TRS-80 / TRS-OS disk volume file (.dsk)
+  --port, -p PORT       TCP port to listen on (default: 65432, ignored if --serial is set)
+  --host, -H HOST       Host/IP address to bind to (default: 0.0.0.0, ignored if --serial is set)
+  --serial, -s [SERIAL] Serial port device (e.g. /dev/cu.usbmodem*, /dev/ttyACM0, COM3, or 'auto')
+  --baud, -b BAUD       Serial baud rate (default: 115200)
+  --rtscts              Enable RTS/CTS hardware flow control for serial (default: False)
+  --list-ports          List detected serial ports and exit
+  --volume, -v VOLUME   Path to TRS-80 / TRS-OS disk volume file (.dsk)
                         (default: Volumes/sys720k.dsk)
   --printer PRINTER     Path to printer spool output file
                         (default: printer/print_out.txt)
@@ -103,7 +140,11 @@ make fetch
 
 To serve an alternate volume:
 ```bash
+# TCP mode
 python3 trs-netd.py --volume Volumes/sys12M.dsk --port 65432
+
+# Serial mode
+python3 trs-netd.py --volume Volumes/sys12M.dsk --serial auto
 ```
 
 To remove all downloaded assets and return the repo to its minimal footprint:
@@ -151,13 +192,9 @@ make test
 ```
 
 The test suite validates:
-* `@ping` &rarr; `@pong` handshake
-* `@bind` &rarr; `@bound` + 256-byte header delivery
-* Sector reads with 8-bit checksum calculation
-* Sector writes with readback verification
-* 256-byte `@echo` transmission
-* Printer byte spooling
-* Session disconnect and reconnect handling
+* **TCP Transport:** Handshake (`@ping`), binding (`@bind`), sector reads/writes with checksums, 256B echo, print spooling, and recovery from bad checksums or stray delimiters.
+* **Serial Transport:** Simulated via a pseudo-terminal (`pty`) testing `@ping`, `@bind`, sector read/write, echo, and printer spooling.
+* **CLI Options:** Verification of `--list-ports` and argument parsing.
 
 ---
 
@@ -167,9 +204,11 @@ The test suite validates:
 trs-net-tcp/
 ├── Makefile            # Convenience run, fetch, test, and clean targets
 ├── README.md           # Project documentation and protocol specification
+├── MOD-USB-RS232.md    # Hardware guide for Olimex MOD-USB-RS232 module
+├── requirements.txt    # Optional dependencies (pyserial for serial mode)
 ├── .gitignore          # Git exclusion rules (.venv, Volumes/, caches, etc.)
-├── trs-netd.py         # Main TCP/IP network server daemon
-├── test_trs_netd.py    # Integration & unit test suite
+├── trs-netd.py         # Main TCP/IP and Serial network server daemon
+├── test_trs_netd.py    # Integration & unit test suite (TCP and Serial)
 ├── Volumes/            # Virtual floppy disk images (fetched via 'make fetch')
 │   ├── sys720k.dsk
 │   ├── sys12M.dsk
@@ -183,4 +222,4 @@ trs-net-tcp/
 ## Credits & License
 
 * **TRS-OS & TRS-NET Protocol:** Created and maintained by **Daniel Paul Martin** ([danielpaulmartin.com](https://danielpaulmartin.com/home/research/)).
-* **trs-net-tcp Daemon:** Modernized TCP/IP implementation for networked Agon family and retrocomputing platforms.
+* **trs-net-tcp Daemon:** Modernized TCP/IP and Serial implementation for networked Agon family and retrocomputing platforms.

@@ -11,8 +11,9 @@ Comprehensive guide for configuring, connecting, operating, and flashing the **O
 3. [Physical Connections & Cabling](#3-physical-connections--cabling)
 4. [Solder Jumpers & Configuration](#4-solder-jumpers--configuration)
 5. [Host Laptop Setup (macOS / Linux / Windows)](#5-host-laptop-setup)
-6. [Agon Light 2 Software & Communication (UART1)](#6-agon-light-2-software--communication-uart1)
-7. [Comprehensive Firmware Flashing Guide](#7-comprehensive-firmware-flashing-guide)
+6. [Using MOD-USB-RS232 with trs-netd](#6-using-mod-usb-rs232-with-trs-netd)
+7. [Agon Light 2 Software & Communication (UART1)](#7-agon-light-2-software--communication-uart1)
+8. [Comprehensive Firmware Flashing Guide](#8-comprehensive-firmware-flashing-guide)
    - [Why Flashing May Be Required](#why-flashing-may-be-required)
    - [Firmware Download](#firmware-download)
    - [Hardware Requirements](#hardware-requirements)
@@ -20,7 +21,7 @@ Comprehensive guide for configuring, connecting, operating, and flashing the **O
    - [Power Supply Considerations During Flashing](#power-supply-considerations-during-flashing)
    - [Step-by-Step Flashing via MPLAB X IPE](#step-by-step-flashing-via-mplab-x-ipe)
    - [Command-Line Flashing Alternative (`ipecmd`)](#command-line-flashing-alternative-ipecmd)
-8. [Quick Troubleshooting Checklist](#8-quick-troubleshooting-checklist)
+9. [Quick Troubleshooting Checklist](#9-quick-troubleshooting-checklist)
 
 ---
 
@@ -128,7 +129,46 @@ The PIC18F14K50 firmware exposes a standard **USB CDC-ACM** (Abstract Control Mo
 
 ---
 
-## 6. Agon Light 2 Software & Communication (UART1)
+## 6. Using MOD-USB-RS232 with `trs-netd`
+
+`trs-netd.py` can serve virtual floppy disks directly to TRS-OS through the MOD-USB-RS232 module plugged into the Agon Light 2 UEXT connector.
+
+### Step 1: Connect Hardware
+1. Connect the 10-pin ribbon cable between the Agon Light 2 UEXT connector and the MOD-USB-RS232 UEXT connector (the keyed notches ensure Pin 1 matches on both ends).
+2. Connect the Mini-USB cable from MOD-USB-RS232 to your host computer.
+3. Power on the Agon Light 2.
+
+### Step 2: Identify the Serial Port
+Run the port scanner to detect the serial port assigned to the module:
+```bash
+make list-ports
+```
+On macOS, the module enumerates as `/dev/cu.usbmodem*` (e.g. `/dev/cu.usbmodem14101`).
+
+### Step 3: Start the Daemon
+Run `trs-netd` targeting the serial port at the standard 115200 baud:
+```bash
+# Auto-detect connected USB serial port:
+make run SERIAL=auto
+
+# Or explicitly specify the port device:
+make run SERIAL=/dev/cu.usbmodem14101
+
+# Or with verbose debug logging:
+make run-verbose SERIAL=/dev/cu.usbmodem14101
+```
+
+### Step 4: Mount Remote Drive in TRS-OS
+From the TRS-OS prompt on your Agon Light 2:
+```text
+SYSTEM (DRIVE=6, DRIVER="NETDVR")
+DIR :6
+```
+Virtual disk images from `Volumes/` are now accessible as local disk drives over the direct MOD-USB-RS232 serial connection!
+
+---
+
+## 7. Agon Light 2 Software & Communication (UART1)
 
 On the Olimex Agon Light 2, the UEXT connector is mapped directly to **eZ80 UART1** (`PC0` = TXD1, `PC1` = RXD1).
 
@@ -174,7 +214,7 @@ void close_serial(void) {
 
 ---
 
-## 7. Comprehensive Firmware Flashing Guide
+## 8. Comprehensive Firmware Flashing Guide
 
 ### Why Flashing May Be Required
 A known manufacturing issue in select Olimex production batches resulted in some MOD-USB-RS232 boards shipping with an internal **factory loopback test routine** rather than the functional USB-to-UART CDC bridge firmware.
@@ -353,11 +393,11 @@ Parameters:
 
 ---
 
-## 8. Quick Troubleshooting Checklist
+## 9. Quick Troubleshooting Checklist
 
 | Problem | Root Cause | Solution |
 | :--- | :--- | :--- |
-| **Terminal prints repetitive `UEXT test ERROR!`** | Module contains factory loopback test code | Re-flash PIC18F14K50 with `Prebuilt.hex` following Section 7. |
+| **Terminal prints repetitive `UEXT test ERROR!`** | Module contains factory loopback test code | Re-flash PIC18F14K50 with `Prebuilt.hex` following Section 8. |
 | **No serial characters transmitted or received** | Jumper configuration incorrect | Verify jumpers `3_RX/3_TX` and `4_TX/4_RX` are both set to default (device mode). |
 | **Agon Light 2 resets or browns out when connected** | Power loop / regulator conflict | Ensure `UEXT_PWR_3.3` jumper on MOD-USB-RS232 is **OPEN**. |
 | **Device not appearing under `/dev/cu.*` on Mac** | Bad USB cable or port | Mini-USB cables can be charge-only. Verify cable data lines with another device; try a direct USB port. |
