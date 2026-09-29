@@ -79,6 +79,9 @@ $(DEFAULT_DISK):
 	unzip -q -o $(ARCHIVE) "Volumes/*"
 	@mkdir -p $(PRINTER_DIR)
 	@rm -f $(ARCHIVE)
+	@echo "Fetching TRSOS_DEMO.JV1 from Shawn Sijnstra's github..."
+	curl -sLO https://github.com/sijnstra/agon-projects/blob/main/OSboot/TRSOS_Demo.JV1
+	@mv TRSOS_DEMO.JV1 Volumes/
 	@echo "Disk volumes ready in $(VOLUMES_DIR)/."
 
 # Run unit and integration tests (uses synthetic disk image in temp dir)
