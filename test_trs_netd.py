@@ -470,5 +470,119 @@ class TestCLIOptions(unittest.TestCase):
         )
 
 
+class TestJV1ToDSKConversion(unittest.TestCase):
+    """Test JV1 to DiskDISK conversion tool and DCT parameter encoding."""
+
+    def test_synthetic_conversion(self) -> None:
+        """Verify DiskDISK header and GAT LSI signature generation."""
+        from jv1_to_dsk import convert_jv1_to_dsk
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            raw_jv1 = td_path / "test.jv1"
+            out_dsk = td_path / "test.dsk"
+
+            # Create 35-track x 10 sec/track x 256B disk
+            raw_jv1.write_bytes(b"\x00" * (35 * 10 * 256))
+
+            convert_jv1_to_dsk(raw_jv1, out_dsk, tracks=35, sectors_per_track=10, dir_track=17)
+            dsk_bytes = out_dsk.read_bytes()
+
+            self.assertEqual(len(dsk_bytes), 256 + 35 * 10 * 256)
+            self.assertEqual(dsk_bytes[:8], b"DiskDISK")
+            self.assertEqual(dsk_bytes[8:11], bytes([0xC3, 0x08, 0x2E]))
+
+            # DCT parameters at bytes 11..18:
+            # DCT+3..DCT+9: 0x00, 0x10, 0x00, 34, 0x09, 0x24, 17
+            expected_dct = bytes([0x00, 0x10, 0x00, 34, 0x09, 0x24, 17])
+            self.assertEqual(dsk_bytes[11:18], expected_dct)
+
+            # Granule size byte at byte 18
+            self.assertEqual(dsk_bytes[18], 5)
+
+            # GAT sector at track 17 sector 0 (offset 256 + 17*10*256 = 43776)
+            gat_offset = 256 + (17 * 10 * 256)
+            lsi_block = dsk_bytes[gat_offset + 245 : gat_offset + 256]
+            self.assertEqual(lsi_block, b"\x03LSI" + expected_dct)
+
+    def test_trsos_demo_cmd_files_loadable(self) -> None:
+        """Verify that all CMD files on TRSOS_DEMO.dsk can be parsed by LOADER."""
+        dsk_path = Path(__file__).parent / "Volumes" / "TRSOS_DEMO.dsk"
+        if not dsk_path.is_file():
+            self.skipTest("Volumes/TRSOS_DEMO.dsk not found")
+
+        data = dsk_path.read_bytes()
+        dct7 = data[15]
+        dct8 = data[16]
+        dct9 = data[17]
+        sec_per_gran = (dct8 & 0x1F) + 1
+        grans_per_trk = ((dct8 >> 5) & 7) + 1
+        dir_cyl = dct9
+        sec_per_trk = (dct7 & 0x1F) + 1
+
+        gat_offset = 256 + (dir_cyl * sec_per_trk * 256)
+        found_cmds = {}
+        for sec in range(1, sec_per_trk):
+            sec_data = data[gat_offset + sec * 256 : gat_offset + (sec + 1) * 256]
+            for i in range(8):
+                entry = sec_data[i * 32 : (i + 1) * 32]
+                if (entry[0] & 0x10) and not (entry[0] & 0x80):
+                    name = entry[5:13].decode("latin1").rstrip()
+                    ext = entry[13:16].decode("latin1").rstrip()
+                    if ext == "CMD":
+                        sec_count = entry[20] | (entry[21] << 8)
+                        last_len = entry[3]
+                        extents = []
+                        for e in range(5):
+                            cyl = entry[22 + e * 2]
+                            gb = entry[22 + e * 2 + 1]
+                            if cyl == 0xFF:
+                                break
+                            extents.append((cyl, gb))
+                        found_cmds[f"{name}.{ext}"] = (sec_count, last_len, extents)
+
+        self.assertIn("LIFE.CMD", found_cmds)
+        for cmd_name, (sec_count, last_len, extents) in found_cmds.items():
+            file_secs = []
+            for cyl, gb in extents:
+                start_g = (gb >> 5) & 7
+                count_g = (gb & 0x1F) + 1
+                for g in range(count_g):
+                    tot_g = start_g + g
+                    c = cyl + (tot_g // grans_per_trk)
+                    rem_g = tot_g % grans_per_trk
+                    for s in range(sec_per_gran):
+                        file_secs.append(c * sec_per_trk + (rem_g * sec_per_gran + s))
+            file_secs = file_secs[:sec_count]
+            file_bytes = bytearray()
+            for s in file_secs:
+                offset = 256 + s * 256
+                file_bytes.extend(data[offset : offset + 256])
+
+            eof = (sec_count - 1) * 256 + (last_len if last_len > 0 else 256)
+            pos = 0
+            found_tra = False
+            while pos < eof:
+                rec_type = file_bytes[pos]
+                pos += 1
+                if rec_type == 1:
+                    raw_len = file_bytes[pos]
+                    pos += 1
+                    pos += 2
+                    b = (raw_len - 2) & 0xFF
+                    pos += (256 if b == 0 else b)
+                elif rec_type == 2:
+                    found_tra = True
+                    break
+                elif rec_type < 0x20:
+                    raw_len = file_bytes[pos]
+                    pos += 1
+                    pos += (256 if raw_len == 0 else raw_len)
+                else:
+                    self.fail(f"Invalid record type 0x{rec_type:02X} in {cmd_name} at pos {pos-1}")
+            self.assertTrue(found_tra, f"Transfer address not found in {cmd_name}")
+
+
 if __name__ == "__main__":
     unittest.main()
+
