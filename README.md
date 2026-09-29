@@ -137,6 +137,7 @@ make fetch
 | `Volumes/sys631.dsk` | 1.2 MB | TRSDOS 6.3.1 system disk image. |
 | `Volumes/sys631.X.dsk` | 1.2 MB | TRSDOS 6.3.1 expanded distribution image. |
 | `Volumes/bldtools.dsk` | 196 KB | Build tools and developer utilities disk. |
+| `Volumes/TRSOS_DEMO.dsk` | 90 KB | 5.25" Single-Sided Single-Density (35-track) demo disk converted from Shawn Sijnstra's JV1. |
 
 To serve an alternate volume:
 ```bash

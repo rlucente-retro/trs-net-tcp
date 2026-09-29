@@ -82,6 +82,8 @@ $(DEFAULT_DISK):
 	@echo "Fetching TRSOS_DEMO.JV1 from Shawn Sijnstra's github..."
 	curl -sLO https://github.com/sijnstra/agon-projects/raw/refs/heads/main/OSboot/TRSOS_Demo.JV1
 	@mv TRSOS_DEMO.JV1 Volumes/
+	@echo "Converting TRSOS_DEMO.JV1 to DiskDISK format (Volumes/TRSOS_DEMO.dsk)..."
+	@python3 jv1_to_dsk.py Volumes/TRSOS_DEMO.JV1 Volumes/TRSOS_DEMO.dsk
 	@echo "Disk volumes ready in $(VOLUMES_DIR)/."
 
 # Run unit and integration tests (uses synthetic disk image in temp dir)
